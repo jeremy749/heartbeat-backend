@@ -46,7 +46,7 @@ def post_beat(
     bpm: Optional[float] = None,
     flags: Optional[List[str]] = None,
     samples: Optional[List[float]] = None,
-    patient: str = "Demo Patient",
+    patient: str = "Demo User",
     url: str = BACKEND_URL,
 ) -> bool:
     """Send one classified beat to the backend. Returns True on success."""

@@ -51,14 +51,50 @@ class BeatIn(BaseModel):
         default=None, description="Device timestamp; server fills in if absent"
     )
     patient: Optional[str] = Field(
-        default=None, description="Patient/identity this beat belongs to"
+        default=None, description="User/owner name; resolved to a user_id server-side"
     )
+    user_id: Optional[int] = Field(
+        default=None, description="User this beat belongs to (takes priority over patient name)"
+    )
+
+
+class LoginIn(BaseModel):
+    """Sign in or sign up with a name + password."""
+
+    name: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class UserOut(BaseModel):
+    id: int
+    name: str
+
+
+class AuthOut(BaseModel):
+    """Returned on successful login: the user plus a session token."""
+
+    id: int
+    name: str
+    token: str
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(default="")
+    new_password: str = Field(..., min_length=1)
+
+
+class AccountOut(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    reading_count: int
 
 
 class BeatOut(BaseModel):
     """A stored beat as returned to the frontend."""
 
     id: int
+    user_id: Optional[int] = None
     patient: str
     class_code: str
     classification: str
