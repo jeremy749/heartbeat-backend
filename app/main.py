@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import math
+import os
 import statistics
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -97,14 +98,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow the Vite dev server (and a couple of common ports) to call the API.
+# Which websites are allowed to call this API.
+#   - local dev ports (Vite)
+#   - any *.netlify.app site (your deployed frontend)
+#   - anything listed in the CORS_ORIGINS env var (comma-separated), e.g. a
+#     custom domain:  CORS_ORIGINS=https://heartbeat.yourdomain.com
+_default_origins = [
+    "http://localhost:5173",
+    "http://localhost:4173",
+    "http://localhost:3000",
+]
+_env_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:4173",
-        "http://localhost:3000",
-    ],
+    allow_origins=_default_origins + _env_origins,
+    allow_origin_regex=r"https://.*\.netlify\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -408,15 +416,19 @@ def export_csv(
     )
     buf = io.StringIO()
     writer = csv.writer(buf)
+    # Friendly, human-readable column headers (no underscores).
     writer.writerow(
-        ["id", "patient", "recorded_at", "classification", "confidence",
-         "is_abnormal", "alert_level", "bpm", "flags"]
+        ["ID", "Patient", "Recorded At", "Classification", "Confidence",
+         "Abnormal", "Alert Level", "Heart Rate (bpm)", "Flags"]
     )
     for r in rows:
         writer.writerow([
             r["id"], r["patient"], r["recorded_at"], r["classification"],
-            f"{r['confidence']:.4f}", int(r["is_abnormal"]), r["alert_level"],
-            r["bpm"] if r["bpm"] is not None else "", "|".join(r["flags"]),
+            f"{round(r['confidence'] * 100)}%",          # 0.97 -> "97%"
+            "Yes" if r["is_abnormal"] else "No",          # 1/0 -> Yes/No
+            r["alert_level"].capitalize(),
+            r["bpm"] if r["bpm"] is not None else "",
+            ", ".join(r["flags"]),
         ])
     return Response(
         content=buf.getvalue(),
