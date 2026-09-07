@@ -16,6 +16,7 @@ Interactive API docs are served at http://localhost:8000/docs
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -38,7 +39,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from . import alerts
 from . import database as db
@@ -124,6 +125,38 @@ def _iso_bound(value: Optional[str], field: str) -> Optional[str]:
         )
 
 
+# How often the background sweep runs. It drops old waveforms, applies the beat
+# retention window if one is set, and clears expired sessions.
+RETENTION_INTERVAL_SECONDS = float(os.environ.get("RETENTION_INTERVAL_SECONDS", "3600"))
+
+
+def run_retention() -> dict:
+    """One retention pass. Safe to call at any time; returns what it did."""
+    result = {
+        "waveforms_dropped": db.prune_samples(),
+        "beats_removed": db.delete_old_beats(),
+        "sessions_purged": db.purge_expired_sessions(),
+    }
+    if any(result.values()):
+        print(
+            f"[heartbeat] retention: {result['waveforms_dropped']} waveform(s) dropped, "
+            f"{result['beats_removed']} beat(s) removed, "
+            f"{result['sessions_purged']} session(s) purged"
+        )
+    return result
+
+
+async def _retention_loop() -> None:
+    """Run the sweep on a timer until the app shuts down."""
+    while True:
+        try:
+            # Off the event loop: these are blocking SQLite writes.
+            await asyncio.to_thread(run_retention)
+        except Exception as exc:  # noqa: BLE001 - a sweep failing must not kill the loop
+            print(f"[heartbeat] retention sweep failed: {exc!r}")
+        await asyncio.sleep(RETENTION_INTERVAL_SECONDS)
+
+
 _DEVICE_KEY: Optional[str] = None
 
 
@@ -165,12 +198,13 @@ def require_ingest(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
-    dropped = db.purge_expired_sessions()
-    if dropped:
-        print(f"[heartbeat] purged {dropped} expired session(s)")
     source = "DEVICE_API_KEY env" if os.environ.get("DEVICE_API_KEY", "").strip() else "generated, stored in the db"
     print(f"[heartbeat] device ingest key ({source}): {device_key()}")
-    yield
+    sweeper = asyncio.create_task(_retention_loop())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
 
 
 app = FastAPI(
@@ -523,9 +557,13 @@ def export_csv(
     until: Optional[str] = Query(None),
     user=Depends(require_user),
 ):
-    """Download the signed-in user's (filtered) history as a CSV spreadsheet."""
-    rows = db.get_history(
-        limit=100000,
+    """Stream the signed-in user's (filtered) history as a CSV spreadsheet.
+
+    Streamed rather than assembled in memory: a long history is exactly when
+    someone wants the export, and that used to mean buffering every row and its
+    rendered text before sending a single byte.
+    """
+    rows = db.iter_history(
         user_id=user["id"],
         class_filter=type,
         abnormal_only=abnormal_only,
@@ -533,24 +571,37 @@ def export_csv(
         since=_iso_bound(since, "since"),
         until=_iso_bound(until, "until"),
     )
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    # Friendly, human-readable column headers (no underscores).
-    writer.writerow(
-        ["ID", "Patient", "Recorded At", "Classification", "Confidence",
-         "Abnormal", "Alert Level", "Heart Rate (bpm)", "Flags"]
-    )
-    for r in rows:
-        writer.writerow([
-            r["id"], r["patient"], r["recorded_at"], r["classification"],
-            f"{round(r['confidence'] * 100)}%",          # 0.97 -> "97%"
-            "Yes" if r["is_abnormal"] else "No",          # 1/0 -> Yes/No
-            r["alert_level"].capitalize(),
-            r["bpm"] if r["bpm"] is not None else "",
-            ", ".join(r["flags"]),
-        ])
-    return Response(
-        content=buf.getvalue(),
+
+    def lines():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        # Friendly, human-readable column headers (no underscores).
+        writer.writerow(
+            ["ID", "Patient", "Recorded At", "Classification", "Confidence",
+             "Abnormal", "Alert Level", "Heart Rate (bpm)", "Flags"]
+        )
+        yield flush()
+
+        for r in rows:
+            writer.writerow([
+                r["id"], r["patient"], r["recorded_at"], r["classification"],
+                f"{round(r['confidence'] * 100)}%",          # 0.97 -> "97%"
+                "Yes" if r["is_abnormal"] else "No",          # 1/0 -> Yes/No
+                r["alert_level"].capitalize(),
+                r["bpm"] if r["bpm"] is not None else "",
+                ", ".join(r["flags"]),
+            ])
+            yield flush()
+
+    return StreamingResponse(
+        lines(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=heartbeat_history.csv"},
     )

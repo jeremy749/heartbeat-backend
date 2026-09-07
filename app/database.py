@@ -26,6 +26,12 @@ DEFAULT_USER_PASSWORD = "demo"  # the seeded demo account's password
 # How long a session token stays valid. 30 days by default.
 SESSION_TTL_HOURS = int(os.environ.get("SESSION_TTL_HOURS", "720"))
 
+# Retention. A beat's 200-sample waveform is ~1.5 KB - at one beat a second that
+# is ~130 MB a day, and it is only needed for the recent-strip view, so the
+# waveforms are dropped well before the beats themselves. 0 disables either one.
+SAMPLE_RETENTION_HOURS = int(os.environ.get("SAMPLE_RETENTION_HOURS", "24"))
+BEAT_RETENTION_DAYS = int(os.environ.get("BEAT_RETENTION_DAYS", "0"))  # 0 = keep forever
+
 
 def db_path() -> Path:
     """Where the SQLite file lives - read per call so HEARTBEAT_DB is honoured
@@ -194,6 +200,9 @@ def init_db() -> None:
             )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_user ON beats(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_beats_user_recorded ON beats(user_id, recorded_at)"
+        )
         conn.commit()
 
     # Seed the demo account so the demo works out of the box (Demo User / demo).
@@ -485,6 +494,69 @@ def get_history(limit=100, offset=0, user_id=None, class_filter=None,
             [*params, limit, offset],
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+
+def iter_history(user_id=None, class_filter=None, abnormal_only=False,
+                 min_confidence=None, since=None, until=None, batch_size=500):
+    """Yield matching beats newest-first, a batch at a time.
+
+    The CSV export used to pull every row into a list before writing a byte;
+    this keeps a bounded amount in memory however long the history is. The
+    connection stays open until the generator is exhausted or closed.
+    """
+    where, params = _filters(user_id, class_filter, abnormal_only, min_confidence, since, until)
+    with _db() as conn:
+        cur = conn.execute(f"SELECT * FROM beats{where} ORDER BY id DESC", params)
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                return
+            for r in rows:
+                yield _row_to_dict(r)
+
+
+# ── Retention ─────────────────────────────────────────────────────────────────
+def prune_samples(older_than_hours: Optional[int] = None) -> int:
+    """Drop stored waveforms past the cutoff, keeping the beats themselves.
+
+    The strip view only ever looks at recent beats, so the bulky part of an old
+    row earns nothing by staying. Returns how many rows were cleared.
+    """
+    hours = SAMPLE_RETENTION_HOURS if older_than_hours is None else older_than_hours
+    if hours <= 0:
+        return 0
+    cutoff = utc_iso(datetime.now(timezone.utc) - timedelta(hours=hours))
+    with _db() as conn:
+        cur = conn.execute(
+            "UPDATE beats SET samples = NULL WHERE samples IS NOT NULL AND recorded_at < ?",
+            (cutoff,),
+        )
+        return cur.rowcount
+
+
+def delete_old_beats(older_than_days: Optional[int] = None) -> int:
+    """Delete beats past the cutoff. Off by default - history is the point."""
+    days = BEAT_RETENTION_DAYS if older_than_days is None else older_than_days
+    if days <= 0:
+        return 0
+    cutoff = utc_iso(datetime.now(timezone.utc) - timedelta(days=days))
+    with _db() as conn:
+        cur = conn.execute("DELETE FROM beats WHERE recorded_at < ?", (cutoff,))
+        return cur.rowcount
+
+
+def vacuum() -> None:
+    """Reclaim file space after a large delete.
+
+    Not part of the automatic sweep: VACUUM rewrites the whole database and
+    holds a lock while it does, so it belongs in a maintenance window rather
+    than on an hourly timer.
+    """
+    conn = _connect()
+    try:
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
 
 
 def get_recent(user_id, n):

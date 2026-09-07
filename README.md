@@ -116,7 +116,16 @@ Two ways to post a beat:
   separate database server needed. It runs in WAL mode, so a reader is never
   blocked behind a writer.
 - Session tokens expire after `SESSION_TTL_HOURS` (30 days by default) and
-  expired rows are purged at startup.
+  expired rows are purged by the retention sweep.
+- A beat's 200-sample waveform is ~1.5 KB, so at one beat a second the database
+  grows ~130 MB a day. Only the recent-strip view reads those samples, so a
+  background sweep drops waveforms older than `SAMPLE_RETENTION_HOURS` (24 by
+  default) while keeping every beat and its metadata. Deleting whole beats is
+  off by default - set `BEAT_RETENTION_DAYS` to enable it. Space is not
+  reclaimed automatically: `database.vacuum()` does that, and it locks the
+  database while it runs, so save it for a maintenance window.
+- The CSV export is streamed, so a long history does not have to fit in memory
+  before the download starts.
 - Repeated sign-in failures for the same name and address are throttled. The
   counts live in memory, so they reset on restart and are per-process - enough
   to slow guessing on a single instance, not a hard guarantee behind several
