@@ -503,8 +503,12 @@ async def websocket_endpoint(ws: WebSocket, token: Optional[str] = Query(default
     """Frontend connects here (as /ws?token=...) to receive its own beats live."""
     user = db.user_for_token(token)
     if not user:
-        # 4401 is in the private range WebSocket leaves to applications; the
-        # frontend reads it as "sign in again" rather than a network blip.
+        # Accept first, *then* close. Closing before accept makes the server
+        # reject the handshake with HTTP 403, which browsers surface as close
+        # code 1006 - indistinguishable from a dropped network, so the client
+        # would reconnect forever instead of signing out. Completing the
+        # handshake lets the 4401 through (private range, "sign in again").
+        await ws.accept()
         await ws.close(code=4401, reason="Sign in required")
         return
     await manager.connect(ws, user["id"])
