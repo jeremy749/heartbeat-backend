@@ -126,7 +126,9 @@ Two ways to post a beat:
   database while it runs, so save it for a maintenance window.
 - The CSV export is streamed, so a long history does not have to fit in memory
   before the download starts.
-- Repeated sign-in failures for the same name and address are throttled. The
+- Repeated sign-in failures for the same name and address are throttled, with the
+  wait in both the Retry-After header (exposed to CORS callers) and the
+  response body. The
   counts live in memory, so they reset on restart and are per-process - enough
   to slow guessing on a single instance, not a hard guarantee behind several
   workers.

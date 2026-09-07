@@ -232,6 +232,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Retry-After is not a CORS-safelisted response header, so without this the
+    # dashboard cannot read how long a throttled sign-in must wait.
+    expose_headers=["Retry-After"],
 )
 
 

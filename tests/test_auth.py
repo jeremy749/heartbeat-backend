@@ -139,3 +139,26 @@ def test_throttling_one_name_does_not_lock_out_another(client):
         client.post("/api/login", json={"name": "Alice", "password": "x"})
 
     assert signup(client, "Bob", "pw")["token"]
+
+
+def test_throttled_response_exposes_retry_after_cross_origin(client):
+    """Retry-After is not CORS-safelisted, so the API must expose it explicitly.
+
+    Without the expose_headers entry the dashboard cannot read the wait on a
+    cross-origin request, which is the only way it is ever deployed.
+    """
+    from app.main import LOGIN_LIMITER
+
+    signup(client, "Alice", "pw")
+    origin = {"Origin": "https://heartbeat.netlify.app"}
+    for _ in range(LOGIN_LIMITER.max_failures):
+        client.post("/api/login", json={"name": "Alice", "password": "x"}, headers=origin)
+
+    r = client.post("/api/login", json={"name": "Alice", "password": "x"}, headers=origin)
+    assert r.status_code == 429
+    assert r.headers["Retry-After"]
+    exposed = r.headers.get("access-control-expose-headers", "")
+    assert "Retry-After" in exposed, exposed
+    # The body carries the same wait, so a client that cannot read the header
+    # still has something to show.
+    assert "Try again in" in r.json()["detail"]
