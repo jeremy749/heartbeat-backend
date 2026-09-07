@@ -10,3 +10,7 @@ env/
 
 # OS
 .DS_Store
+
+# WAL sidecar files
+*.db-wal
+*.db-shm

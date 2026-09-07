@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import time
 from typing import Dict, List, Optional
@@ -38,6 +39,10 @@ import requests
 # same machine but takes the direct IPv4 route.
 BACKEND_URL = "http://127.0.0.1:8000/api/beats"
 
+# The backend refuses unauthenticated beats. Set HEARTBEAT_DEVICE_KEY to the key
+# the server prints at startup, or pass --key.
+DEVICE_KEY = os.environ.get("HEARTBEAT_DEVICE_KEY", "")
+
 
 def post_beat(
     class_code: str,
@@ -48,6 +53,7 @@ def post_beat(
     samples: Optional[List[float]] = None,
     patient: str = "Demo User",
     url: str = BACKEND_URL,
+    key: Optional[str] = None,
 ) -> bool:
     """Send one classified beat to the backend. Returns True on success."""
     payload = {
@@ -65,8 +71,16 @@ def post_beat(
         # request through the configured proxy, which can't reach your local
         # server and times out.
         resp = requests.post(
-            url, json=payload, timeout=3, proxies={"http": None, "https": None}
+            url,
+            json=payload,
+            timeout=3,
+            headers={"X-Device-Key": key or DEVICE_KEY},
+            proxies={"http": None, "https": None},
         )
+        if resp.status_code == 401:
+            print("  [device_bridge: rejected - set HEARTBEAT_DEVICE_KEY (or --key) to the")
+            print("   key the backend prints at startup)]")
+            return False
         resp.raise_for_status()
         return True
     except requests.RequestException as exc:
@@ -96,7 +110,7 @@ def _fake_beat_window(code: str, n: int = 200) -> List[float]:
     return samples
 
 
-def _demo(n: int = 50, url: str = BACKEND_URL) -> None:
+def _demo(n: int = 50, url: str = BACKEND_URL, key: Optional[str] = None) -> None:
     """Push fake beats so you can see the dashboard update without hardware."""
     classes = ["N", "N", "N", "V", "S", "F", "Q"]  # weighted toward Normal
     print(f"Posting {n} demo beats to {url} (Ctrl+C to stop)...")
@@ -107,7 +121,7 @@ def _demo(n: int = 50, url: str = BACKEND_URL) -> None:
         probs[code] = conf
         bpm = round(random.uniform(58, 105), 0)
         samples = _fake_beat_window(code)
-        ok = post_beat(code, conf, probs, bpm=bpm, samples=samples)
+        ok = post_beat(code, conf, probs, bpm=bpm, samples=samples, key=key)
         print(f"  beat {i + 1:>3}  {code}  conf={conf:.2f}  bpm={bpm}  {'ok' if ok else 'FAILED'}")
         time.sleep(0.8)
 
@@ -117,9 +131,14 @@ if __name__ == "__main__":
     parser.add_argument("--demo", action="store_true", help="Push fake beats to the backend")
     parser.add_argument("--n", type=int, default=50, help="Number of demo beats")
     parser.add_argument("--url", default=BACKEND_URL, help="Backend ingest URL")
+    parser.add_argument(
+        "--key",
+        default=DEVICE_KEY,
+        help="Device ingest key (default: $HEARTBEAT_DEVICE_KEY)",
+    )
     args = parser.parse_args()
 
     if args.demo:
-        _demo(args.n, args.url)
+        _demo(args.n, args.url, args.key)
     else:
         parser.print_help()

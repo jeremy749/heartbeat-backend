@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -33,15 +34,43 @@ def _new_password(password: str) -> tuple[str, str]:
     return salt, _hash_password(password, salt)
 
 
+BUSY_TIMEOUT_MS = 5000
+
+
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    # WAL lets readers keep working while a writer holds the lock. FastAPI runs
+    # these sync functions in a threadpool, so without it two overlapping
+    # requests raise "database is locked". busy_timeout makes a writer wait its
+    # turn instead of failing instantly.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+@contextmanager
+def _db():
+    """Open a connection, commit on success, roll back on error, always close.
+
+    sqlite3's own `with conn:` is a *transaction* manager - it commits, but it
+    never closes. Using it directly leaked one connection per request.
+    """
+    conn = _connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
     """Create tables if needed and migrate older databases in place."""
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -59,6 +88,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN salt TEXT")
         if "password_hash" not in ucols:
             conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -101,7 +138,10 @@ def init_db() -> None:
         conn.commit()
 
         # Backfill: give any reading without a user_id one, derived from its
-        # patient name (so old name-based rows become id-linked).
+        # patient name (so old name-based rows become id-linked). Resolved on
+        # *this* connection - opening a second one here would block against the
+        # write lock this transaction already holds, then time out.
+        now = datetime.now(timezone.utc).isoformat()
         orphan_names = [
             r["patient"]
             for r in conn.execute(
@@ -109,7 +149,13 @@ def init_db() -> None:
             )
         ]
         for name in orphan_names:
-            uid = get_or_create_user(name or DEFAULT_USER)["id"]
+            uname = (name or DEFAULT_USER).strip() or DEFAULT_USER
+            conn.execute(
+                "INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", (uname, now)
+            )
+            uid = conn.execute(
+                "SELECT id FROM users WHERE name = ?", (uname,)
+            ).fetchone()["id"]
             conn.execute(
                 "UPDATE beats SET user_id = ? WHERE user_id IS NULL AND patient = ?",
                 (uid, name),
@@ -126,7 +172,7 @@ def get_or_create_user(name: str) -> dict:
     """Return {id, name} for this name, creating the user if needed."""
     name = (name or DEFAULT_USER).strip() or DEFAULT_USER
     now = datetime.now(timezone.utc).isoformat()
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", (name, now)
         )
@@ -135,8 +181,15 @@ def get_or_create_user(name: str) -> dict:
         return {"id": row["id"], "name": row["name"]}
 
 
+def get_user(user_id: int) -> Optional[dict]:
+    """Return {id, name} for an existing user id, or None if there is no such user."""
+    with _db() as conn:
+        row = conn.execute("SELECT id, name FROM users WHERE id = ?", (user_id,)).fetchone()
+        return {"id": row["id"], "name": row["name"]} if row else None
+
+
 def list_users() -> List[dict]:
-    with _connect() as conn:
+    with _db() as conn:
         rows = conn.execute("SELECT id, name FROM users ORDER BY name").fetchall()
         return [{"id": r["id"], "name": r["name"]} for r in rows]
 
@@ -144,7 +197,7 @@ def list_users() -> List[dict]:
 def _ensure_password(name: str, password: str) -> None:
     """Create the user if missing and give it a password only if it has none."""
     user = get_or_create_user(name)
-    with _connect() as conn:
+    with _db() as conn:
         row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (user["id"],)).fetchone()
         if row and not row["password_hash"]:
             salt, ph = _new_password(password)
@@ -163,7 +216,7 @@ def authenticate(name: str, password: str) -> Optional[dict]:
     if not name or not password:
         return None
     user = get_or_create_user(name)
-    with _connect() as conn:
+    with _db() as conn:
         row = conn.execute(
             "SELECT salt, password_hash FROM users WHERE id = ?", (user["id"],)
         ).fetchone()
@@ -179,7 +232,7 @@ def authenticate(name: str, password: str) -> Optional[dict]:
 
 def create_session(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
             (token, user_id, datetime.now(timezone.utc).isoformat()),
@@ -191,7 +244,7 @@ def create_session(user_id: int) -> str:
 def user_for_token(token: Optional[str]) -> Optional[dict]:
     if not token:
         return None
-    with _connect() as conn:
+    with _db() as conn:
         row = conn.execute(
             """
             SELECT u.id, u.name FROM sessions s
@@ -204,15 +257,30 @@ def user_for_token(token: Optional[str]) -> Optional[dict]:
 
 
 def delete_session(token: str) -> None:
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
         conn.commit()
+
+
+def get_or_create_device_key() -> str:
+    """The shared secret devices present to POST beats.
+
+    Generated once and stored, so it survives restarts. Overridden by the
+    DEVICE_API_KEY environment variable when that is set (see app.main).
+    """
+    with _db() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'device_api_key'").fetchone()
+        if row:
+            return row["value"]
+        key = secrets.token_urlsafe(24)
+        conn.execute("INSERT INTO meta (key, value) VALUES ('device_api_key', ?)", (key,))
+        return key
 
 
 # ── Account management ────────────────────────────────────────────────────────
 def get_account(user_id: int) -> Optional[dict]:
     """Account summary: name, when it was created, and how many readings exist."""
-    with _connect() as conn:
+    with _db() as conn:
         u = conn.execute(
             "SELECT id, name, created_at FROM users WHERE id = ?", (user_id,)
         ).fetchone()
@@ -228,7 +296,7 @@ def change_password(user_id: int, current: str, new: str) -> bool:
     """Change a password after checking the current one. Returns False if wrong."""
     if not new:
         return False
-    with _connect() as conn:
+    with _db() as conn:
         row = conn.execute(
             "SELECT salt, password_hash FROM users WHERE id = ?", (user_id,)
         ).fetchone()
@@ -246,7 +314,7 @@ def change_password(user_id: int, current: str, new: str) -> bool:
 
 def delete_user_readings(user_id: int) -> int:
     """Delete all of a user's beats (keep the account). Returns rows removed."""
-    with _connect() as conn:
+    with _db() as conn:
         cur = conn.execute("DELETE FROM beats WHERE user_id = ?", (user_id,))
         conn.commit()
         return cur.rowcount
@@ -254,7 +322,7 @@ def delete_user_readings(user_id: int) -> int:
 
 def delete_user(user_id: int) -> None:
     """Delete a user, their readings, and their sessions entirely."""
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute("DELETE FROM beats WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -264,7 +332,7 @@ def delete_user(user_id: int) -> None:
 # ── ECG strip replay + HRV inputs ─────────────────────────────────────────────
 def get_recent_with_samples(user_id: int, n: int) -> List[dict]:
     """Most recent n beats that carry sample windows, oldest first."""
-    with _connect() as conn:
+    with _db() as conn:
         rows = conn.execute(
             "SELECT samples, bpm, recorded_at FROM beats "
             "WHERE user_id = ? AND samples IS NOT NULL ORDER BY id DESC LIMIT ?",
@@ -278,7 +346,7 @@ def get_recent_with_samples(user_id: int, n: int) -> List[dict]:
 
 def get_bpm_series(user_id: int, n: int = 200) -> List[float]:
     """Recent heart-rate values (oldest first) for HRV calculation."""
-    with _connect() as conn:
+    with _db() as conn:
         rows = conn.execute(
             "SELECT bpm FROM beats WHERE user_id = ? AND bpm IS NOT NULL ORDER BY id DESC LIMIT ?",
             (user_id, n),
@@ -304,7 +372,7 @@ def insert_beat(
     recorded_at: Optional[datetime],
 ) -> dict:
     ts = (recorded_at or datetime.now(timezone.utc)).isoformat()
-    with _connect() as conn:
+    with _db() as conn:
         cur = conn.execute(
             """
             INSERT INTO beats
@@ -352,7 +420,7 @@ def _filters(user_id, class_filter, abnormal_only, min_confidence, since, until)
 def get_history(limit=100, offset=0, user_id=None, class_filter=None,
                 abnormal_only=False, min_confidence=None, since=None, until=None):
     where, params = _filters(user_id, class_filter, abnormal_only, min_confidence, since, until)
-    with _connect() as conn:
+    with _db() as conn:
         rows = conn.execute(
             f"SELECT * FROM beats{where} ORDER BY id DESC LIMIT ? OFFSET ?",
             [*params, limit, offset],
@@ -362,7 +430,7 @@ def get_history(limit=100, offset=0, user_id=None, class_filter=None,
 
 def get_recent(user_id, n):
     where, params = _filters(user_id, None, False, None, None, None)
-    with _connect() as conn:
+    with _db() as conn:
         rows = conn.execute(
             f"SELECT classification FROM beats{where} ORDER BY id DESC LIMIT ?",
             [*params, n],
@@ -372,7 +440,7 @@ def get_recent(user_id, n):
 
 def get_latest(user_id=None):
     where, params = _filters(user_id, None, False, None, None, None)
-    with _connect() as conn:
+    with _db() as conn:
         row = conn.execute(
             f"SELECT * FROM beats{where} ORDER BY id DESC LIMIT 1", params
         ).fetchone()
@@ -381,7 +449,7 @@ def get_latest(user_id=None):
 
 def get_stats(user_id=None):
     where, params = _filters(user_id, None, False, None, None, None)
-    with _connect() as conn:
+    with _db() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM beats{where}", params).fetchone()[0]
         abn_where = where + (" AND " if where else " WHERE ") + "is_abnormal = 1"
         abnormal = conn.execute(f"SELECT COUNT(*) FROM beats{abn_where}", params).fetchone()[0]
@@ -402,7 +470,7 @@ def get_stats(user_id=None):
 def get_trends(user_id=None, points=60):
     where, params = _filters(user_id, None, False, None, None, None)
     bpm_clause = (where + " AND " if where else " WHERE ") + "bpm IS NOT NULL"
-    with _connect() as conn:
+    with _db() as conn:
         hr_rows = conn.execute(
             f"SELECT recorded_at, bpm FROM beats{bpm_clause} ORDER BY id DESC LIMIT ?",
             [*params, points],

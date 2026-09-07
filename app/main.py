@@ -21,10 +21,11 @@ import io
 import json
 import math
 import os
+import secrets
 import statistics
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +68,13 @@ def _hrv(bpms: List[float]) -> dict:
     }
 
 
+def _bearer(authorization: Optional[str]) -> Optional[str]:
+    """Pull the token out of an `Authorization: Bearer <token>` header."""
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:]
+    return None
+
+
 def require_user(
     authorization: Optional[str] = Header(default=None),
     token: Optional[str] = Query(default=None),
@@ -75,19 +83,55 @@ def require_user(
 
     The query form lets plain download links (CSV export) carry the token.
     """
-    tok = None
-    if authorization and authorization.lower().startswith("bearer "):
-        tok = authorization[7:]
-    tok = tok or token
-    user = db.user_for_token(tok)
+    user = db.user_for_token(_bearer(authorization) or token)
     if not user:
         raise HTTPException(status_code=401, detail="Not signed in")
     return user
 
 
+_DEVICE_KEY: Optional[str] = None
+
+
+def device_key() -> str:
+    """The shared secret a device/classifier must present to POST beats.
+
+    Read from the DEVICE_API_KEY environment variable when set; otherwise one is
+    generated and stored in the database so it stays the same across restarts.
+    Either way it is printed at startup.
+    """
+    global _DEVICE_KEY
+    if _DEVICE_KEY is None:
+        _DEVICE_KEY = os.environ.get("DEVICE_API_KEY", "").strip() or db.get_or_create_device_key()
+    return _DEVICE_KEY
+
+
+def require_ingest(
+    x_device_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
+) -> Optional[dict]:
+    """Authorize a beat ingest, by device key or by a signed-in user's token.
+
+    Returns the signed-in user when a session token was used - their beats are
+    then forced onto their own account - or None when a trusted device key was
+    used, which may name the patient it is recording.
+    """
+    if x_device_key and secrets.compare_digest(x_device_key, device_key()):
+        return None
+    user = db.user_for_token(_bearer(authorization) or token)
+    if user:
+        return user
+    raise HTTPException(
+        status_code=401,
+        detail="Beat ingest needs an X-Device-Key header or a signed-in session token.",
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    source = "DEVICE_API_KEY env" if os.environ.get("DEVICE_API_KEY", "").strip() else "generated, stored in the db"
+    print(f"[heartbeat] device ingest key ({source}): {device_key()}")
     yield
 
 
@@ -121,26 +165,36 @@ app.add_middleware(
 
 # ── WebSocket connection manager (live push to the dashboard) ─────────────────
 class ConnectionManager:
+    """Live sockets, grouped by user.
+
+    Keyed by user_id so a beat only reaches the person it belongs to - a flat
+    list streamed everyone's ECG to every open dashboard.
+    """
+
     def __init__(self) -> None:
-        self.active: List[WebSocket] = []
+        self.active: Dict[int, List[WebSocket]] = {}
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(self, ws: WebSocket, user_id: int) -> None:
         await ws.accept()
-        self.active.append(ws)
+        self.active.setdefault(user_id, []).append(ws)
 
-    def disconnect(self, ws: WebSocket) -> None:
-        if ws in self.active:
-            self.active.remove(ws)
+    def disconnect(self, ws: WebSocket, user_id: int) -> None:
+        conns = self.active.get(user_id)
+        if not conns or ws not in conns:
+            return
+        conns.remove(ws)
+        if not conns:
+            del self.active[user_id]
 
-    async def broadcast(self, message: dict) -> None:
+    async def broadcast(self, user_id: int, message: dict) -> None:
         dead = []
-        for ws in self.active:
+        for ws in list(self.active.get(user_id, [])):
             try:
                 await ws.send_text(json.dumps(message, default=str))
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.disconnect(ws)
+            self.disconnect(ws, user_id)
 
 
 manager = ConnectionManager()
@@ -232,17 +286,24 @@ def delete_account(user=Depends(require_user)):
 
 
 @app.post("/api/beats", response_model=BeatOut, tags=["beats"])
-async def ingest_beat(beat: BeatIn):
+async def ingest_beat(beat: BeatIn, ingestor: Optional[dict] = Depends(require_ingest)):
     """Ingest one classified beat from the classifier/device, store and broadcast it."""
     code, name = _resolve_class(beat)
     is_abnormal = code in ABNORMAL_CLASSES
 
-    # Resolve the owning user: prefer an explicit user_id, else the name.
-    if beat.user_id is not None:
-        user_id, patient = beat.user_id, (beat.patient or db.DEFAULT_USER)
+    # Resolve the owning user.
+    if ingestor is not None:
+        # Authorized by session token: the beat lands on that user's own
+        # account, whatever patient/user_id the payload claims.
+        owner = ingestor
+    elif beat.user_id is not None:
+        # Authorized by device key, targeting an existing account by id.
+        owner = db.get_user(beat.user_id)
+        if owner is None:
+            raise HTTPException(status_code=404, detail=f"No user with id {beat.user_id}")
     else:
-        user = db.get_or_create_user(beat.patient or db.DEFAULT_USER)
-        user_id, patient = user["id"], user["name"]
+        owner = db.get_or_create_user(beat.patient or db.DEFAULT_USER)
+    user_id, patient = owner["id"], owner["name"]
 
     # Compute the alert level here, on the server (single source of truth),
     # using this user's recent beats so runs of abnormal beats count.
@@ -265,7 +326,7 @@ async def ingest_beat(beat: BeatIn):
         recorded_at=beat.recorded_at,
     )
 
-    await manager.broadcast({"type": "beat", "data": stored, "samples": beat.samples})
+    await manager.broadcast(user_id, {"type": "beat", "data": stored, "samples": beat.samples})
     return stored
 
 
@@ -438,14 +499,20 @@ def export_csv(
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    """Frontend connects here to receive each new beat in real time."""
-    await manager.connect(ws)
+async def websocket_endpoint(ws: WebSocket, token: Optional[str] = Query(default=None)):
+    """Frontend connects here (as /ws?token=...) to receive its own beats live."""
+    user = db.user_for_token(token)
+    if not user:
+        # 4401 is in the private range WebSocket leaves to applications; the
+        # frontend reads it as "sign in again" rather than a network blip.
+        await ws.close(code=4401, reason="Sign in required")
+        return
+    await manager.connect(ws, user["id"])
     try:
         while True:
             # We don't expect inbound messages; this keeps the socket open.
             await ws.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(ws)
+        manager.disconnect(ws, user["id"])
     except Exception:
-        manager.disconnect(ws)
+        manager.disconnect(ws, user["id"])
