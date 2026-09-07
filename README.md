@@ -1,5 +1,7 @@
 # Heartbeat Backend
 
+[![CI](https://github.com/jeremy749/heartbeat-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremy749/heartbeat-backend/actions/workflows/ci.yml)
+
 FastAPI server that connects the ECG device + AI classifier to the React dashboard.
 
 ## Where it fits
@@ -40,7 +42,23 @@ device or classifier must send to post beats:
 ```
 
 Set `DEVICE_API_KEY` to pin it to a value you choose (do this in deployment);
-otherwise one is generated on first run and reused from then on.
+otherwise one is generated on first run and reused from then on. See
+[`.env.example`](.env.example) for every setting and its default.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite covers sign-in and session expiry, the login throttle, who may post a
+beat and whose account it lands on, per-user WebSocket delivery, the alert
+engine, timestamp handling, and opening an older database in place. One file,
+`tests/test_websocket_live.py`, runs the app under a real uvicorn server: the
+close code a browser sees differs from what `TestClient` reports, and that
+difference is the difference between the dashboard signing out and reconnecting
+forever.
 
 ## Try it without hardware
 
@@ -95,7 +113,16 @@ Two ways to post a beat:
 ## Notes
 
 - Storage is SQLite (`heartbeat.db`), created automatically on first run. No
-  separate database server needed.
+  separate database server needed. It runs in WAL mode, so a reader is never
+  blocked behind a writer.
+- Session tokens expire after `SESSION_TTL_HOURS` (30 days by default) and
+  expired rows are purged at startup.
+- Repeated sign-in failures for the same name and address are throttled. The
+  counts live in memory, so they reset on restart and are per-process - enough
+  to slow guessing on a single instance, not a hard guarantee behind several
+  workers.
+- Timestamps are normalized to UTC on the way in, so `since`/`until` filters
+  compare correctly whatever offset the device sends.
 - The WebSocket is per-user: a beat is pushed only to sockets belonging to the
   account that owns it.
 - This is an educational/research project, **not** a medical device. Don't use

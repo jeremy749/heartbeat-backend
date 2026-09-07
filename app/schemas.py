@@ -76,6 +76,9 @@ class AuthOut(BaseModel):
     id: int
     name: str
     token: str
+    # True when this sign-in created the account, so the UI can say so rather
+    # than letting a typo silently look like a fresh, empty history.
+    created: bool = False
 
 
 class ChangePasswordIn(BaseModel):

@@ -14,3 +14,6 @@ env/
 # WAL sidecar files
 *.db-wal
 *.db-shm
+
+# Local env
+.env

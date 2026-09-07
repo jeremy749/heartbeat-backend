@@ -14,14 +14,37 @@ import os
 import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-DB_PATH = Path(os.environ.get("HEARTBEAT_DB", Path(__file__).resolve().parent.parent / "heartbeat.db"))
+_DEFAULT_DB = Path(__file__).resolve().parent.parent / "heartbeat.db"
 
 DEFAULT_USER = "Demo User"
 DEFAULT_USER_PASSWORD = "demo"  # the seeded demo account's password
+
+# How long a session token stays valid. 30 days by default.
+SESSION_TTL_HOURS = int(os.environ.get("SESSION_TTL_HOURS", "720"))
+
+
+def db_path() -> Path:
+    """Where the SQLite file lives - read per call so HEARTBEAT_DB is honoured
+    even when it is set after this module is imported (as tests do)."""
+    return Path(os.environ.get("HEARTBEAT_DB") or _DEFAULT_DB)
+
+
+def utc_iso(dt: Optional[datetime] = None) -> str:
+    """Format an instant as a UTC ISO string.
+
+    Timestamps are compared as text in SQL, so they must all share one offset:
+    "2026-01-01T05:00:00+05:00" and "2026-01-01T00:00:00+00:00" are the same
+    moment but sort apart, which silently broke the since/until filters. A naive
+    datetime is taken to be UTC already.
+    """
+    dt = dt or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 # ── Password hashing (stdlib only) ────────────────────────────────────────────
@@ -38,7 +61,7 @@ BUSY_TIMEOUT_MS = 5000
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
+    conn = sqlite3.connect(db_path(), check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     # WAL lets readers keep working while a writer holds the lock. FastAPI runs
     # these sync functions in a threadpool, so without it two overlapping
@@ -101,10 +124,19 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 token      TEXT    PRIMARY KEY,
                 user_id    INTEGER NOT NULL,
-                created_at TEXT    NOT NULL
+                created_at TEXT    NOT NULL,
+                expires_at TEXT
             )
             """
         )
+        # Sessions from before expiry existed: give them one, measured from
+        # when they were created, rather than signing everybody out at once.
+        if "expires_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}:
+            conn.execute("ALTER TABLE sessions ADD COLUMN expires_at TEXT")
+            conn.execute(
+                "UPDATE sessions SET expires_at = datetime(created_at, ?) WHERE expires_at IS NULL",
+                (f"+{SESSION_TTL_HOURS} hours",),
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS beats (
@@ -161,6 +193,7 @@ def init_db() -> None:
                 (uid, name),
             )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_user ON beats(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
         conn.commit()
 
     # Seed the demo account so the demo works out of the box (Demo User / demo).
@@ -171,7 +204,7 @@ def init_db() -> None:
 def get_or_create_user(name: str) -> dict:
     """Return {id, name} for this name, creating the user if needed."""
     name = (name or DEFAULT_USER).strip() or DEFAULT_USER
-    now = datetime.now(timezone.utc).isoformat()
+    now = utc_iso()
     with _db() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", (name, now)
@@ -206,54 +239,80 @@ def _ensure_password(name: str, password: str) -> None:
 
 
 def authenticate(name: str, password: str) -> Optional[dict]:
-    """Sign in or sign up.
+    """Sign in or sign up. Returns {id, name, created} or None on a bad password.
 
-    - New name: creates the account with this password.
-    - Existing account without a password yet: sets it (one-time migration).
-    - Existing account with a password: must match, else returns None.
+    - New name: creates the account with this password (created=True).
+    - Existing account without a password yet: adopts it (one-time migration).
+    - Existing account with a password: must match, else None.
+
+    A wrong password never creates or modifies an account.
     """
     name = (name or "").strip()
     if not name or not password:
         return None
-    user = get_or_create_user(name)
     with _db() as conn:
         row = conn.execute(
-            "SELECT salt, password_hash FROM users WHERE id = ?", (user["id"],)
+            "SELECT id, name, salt, password_hash FROM users WHERE name = ?", (name,)
         ).fetchone()
+        if row is None:
+            salt, ph = _new_password(password)
+            cur = conn.execute(
+                "INSERT INTO users (name, salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (name, salt, ph, utc_iso()),
+            )
+            return {"id": cur.lastrowid, "name": name, "created": True}
         if not row["password_hash"]:
             salt, ph = _new_password(password)
-            conn.execute("UPDATE users SET salt = ?, password_hash = ? WHERE id = ?", (salt, ph, user["id"]))
-            conn.commit()
-            return user
+            conn.execute(
+                "UPDATE users SET salt = ?, password_hash = ? WHERE id = ?", (salt, ph, row["id"])
+            )
+            return {"id": row["id"], "name": row["name"], "created": False}
         if secrets.compare_digest(_hash_password(password, row["salt"]), row["password_hash"]):
-            return user
+            return {"id": row["id"], "name": row["name"], "created": False}
         return None
 
 
-def create_session(user_id: int) -> str:
+def create_session(user_id: int, ttl_hours: Optional[int] = None) -> str:
     token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    ttl = SESSION_TTL_HOURS if ttl_hours is None else ttl_hours
     with _db() as conn:
         conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
-            (token, user_id, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, user_id, utc_iso(now), utc_iso(now + timedelta(hours=ttl))),
         )
         conn.commit()
     return token
 
 
 def user_for_token(token: Optional[str]) -> Optional[dict]:
+    """The user behind a session token, or None if it is unknown or expired."""
     if not token:
         return None
     with _db() as conn:
         row = conn.execute(
             """
-            SELECT u.id, u.name FROM sessions s
+            SELECT u.id, u.name, s.expires_at FROM sessions s
             JOIN users u ON u.id = s.user_id
             WHERE s.token = ?
             """,
             (token,),
         ).fetchone()
-        return {"id": row["id"], "name": row["name"]} if row else None
+        if row is None:
+            return None
+        if row["expires_at"] and row["expires_at"] <= utc_iso():
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            return None
+        return {"id": row["id"], "name": row["name"]}
+
+
+def purge_expired_sessions() -> int:
+    """Drop timed-out sessions. Returns how many rows went."""
+    with _db() as conn:
+        cur = conn.execute(
+            "DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at <= ?", (utc_iso(),)
+        )
+        return cur.rowcount
 
 
 def delete_session(token: str) -> None:
@@ -371,7 +430,7 @@ def insert_beat(
     samples: Optional[List[float]],
     recorded_at: Optional[datetime],
 ) -> dict:
-    ts = (recorded_at or datetime.now(timezone.utc)).isoformat()
+    ts = utc_iso(recorded_at)
     with _db() as conn:
         cur = conn.execute(
             """

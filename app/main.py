@@ -27,12 +27,22 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from . import alerts
 from . import database as db
+from .ratelimit import FailureLimiter
 from .schemas import (
     ABNORMAL_CLASSES,
     CLASS_NAMES,
@@ -89,6 +99,31 @@ def require_user(
     return user
 
 
+# Slow down password guessing: after this many failures for the same
+# name+address inside the window, sign-in is refused until they age out.
+LOGIN_LIMITER = FailureLimiter(
+    max_failures=int(os.environ.get("LOGIN_MAX_FAILURES", "8")),
+    window_seconds=float(os.environ.get("LOGIN_WINDOW_SECONDS", "300")),
+)
+
+
+def _iso_bound(value: Optional[str], field: str) -> Optional[str]:
+    """Normalize a since/until filter to the same UTC form the rows are stored in.
+
+    Without this, a bound written in another offset compares wrongly against the
+    stored text and quietly returns the wrong rows.
+    """
+    if not value:
+        return None
+    try:
+        return db.utc_iso(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be an ISO timestamp, e.g. 2026-01-01T00:00:00Z",
+        )
+
+
 _DEVICE_KEY: Optional[str] = None
 
 
@@ -130,6 +165,9 @@ def require_ingest(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    dropped = db.purge_expired_sessions()
+    if dropped:
+        print(f"[heartbeat] purged {dropped} expired session(s)")
     source = "DEVICE_API_KEY env" if os.environ.get("DEVICE_API_KEY", "").strip() else "generated, stored in the db"
     print(f"[heartbeat] device ingest key ({source}): {device_key()}")
     yield
@@ -223,17 +261,37 @@ def root():
 
 
 @app.post("/api/login", response_model=AuthOut, tags=["users"])
-def login(body: LoginIn):
+def login(body: LoginIn, request: Request):
     """Sign in or sign up with name + password; returns a session token.
 
-    First time a name is used, the given password is set for it. After that the
-    password must match.
+    First time a name is used, the given password is set for it and `created` is
+    true. After that the password must match. Repeated failures for the same
+    name and address are throttled.
     """
+    client = request.client.host if request.client else "?"
+    key = f"{(body.name or '').strip().lower()}|{client}"
+
+    wait = LOGIN_LIMITER.retry_after(key)
+    if wait > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed sign-in attempts. Try again in {int(wait) + 1}s.",
+            headers={"Retry-After": str(int(wait) + 1)},
+        )
+
     user = db.authenticate(body.name, body.password)
     if not user:
+        LOGIN_LIMITER.record_failure(key)
         raise HTTPException(status_code=401, detail="Wrong password for that name.")
+
+    LOGIN_LIMITER.reset(key)
     token = db.create_session(user["id"])
-    return {"id": user["id"], "name": user["name"], "token": token}
+    return {
+        "id": user["id"],
+        "name": user["name"],
+        "token": token,
+        "created": user.get("created", False),
+    }
 
 
 @app.post("/api/logout", tags=["users"])
@@ -349,8 +407,8 @@ def history(
         class_filter=type,
         abnormal_only=abnormal_only,
         min_confidence=min_confidence,
-        since=since,
-        until=until,
+        since=_iso_bound(since, "since"),
+        until=_iso_bound(until, "until"),
     )
 
 
@@ -472,8 +530,8 @@ def export_csv(
         class_filter=type,
         abnormal_only=abnormal_only,
         min_confidence=min_confidence,
-        since=since,
-        until=until,
+        since=_iso_bound(since, "since"),
+        until=_iso_bound(until, "until"),
     )
     buf = io.StringIO()
     writer = csv.writer(buf)
