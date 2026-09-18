@@ -43,6 +43,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from . import alerts
 from . import database as db
+from . import demo
 from .ratelimit import FailureLimiter
 from .schemas import (
     ABNORMAL_CLASSES,
@@ -218,6 +219,16 @@ def require_ingest(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+
+    # On a host with an ephemeral disk the database is empty after every cold
+    # start, and an empty dashboard is a bad first impression for anyone opening
+    # a shared link. Seeding is off unless SEED_DEMO is set, and does nothing
+    # when the demo account already has readings.
+    if os.environ.get("SEED_DEMO", "").strip().lower() in {"1", "true", "yes"}:
+        seeded = demo.seed_demo_data()
+        if seeded:
+            print(f"[heartbeat] seeded the demo account with {seeded} readings")
+
     source = "DEVICE_API_KEY env" if os.environ.get("DEVICE_API_KEY", "").strip() else "generated, stored in the db"
     print(f"[heartbeat] device ingest key ({source}): {device_key()}")
     sweeper = asyncio.create_task(_retention_loop())

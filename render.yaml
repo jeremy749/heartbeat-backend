@@ -1,0 +1,34 @@
+# Render blueprint: New > Blueprint, point it at this repo, and it reads this.
+#
+# The free plan has no persistent disk and spins the service down after about
+# 15 minutes idle, so the database is empty again on the next request. SEED_DEMO
+# makes the server rebuild the demo recording on startup, which keeps a shared
+# link presentable - accounts anyone creates, though, do not survive a restart.
+#
+# To keep real data, move to a plan with a disk and uncomment the disk block
+# below; HEARTBEAT_DB already points inside it.
+services:
+  - type: web
+    name: heartbeat-backend
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: SEED_DEMO
+        value: "1"
+      # Generated once by Render and kept across deploys, so the device key
+      # does not change under a running classifier.
+      - key: DEVICE_API_KEY
+        generateValue: true
+      # The dashboard's own origin. *.netlify.app is already allowed in code;
+      # set this if you use a custom domain.
+      - key: CORS_ORIGINS
+        sync: false
+      - key: HEARTBEAT_DB
+        value: /data/heartbeat.db
+
+    # Uncomment for storage that survives a deploy (a paid feature).
+    # disk:
+    #   name: heartbeat-data
+    #   mountPath: /data
+    #   sizeGB: 1

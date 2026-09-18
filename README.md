@@ -45,6 +45,35 @@ Set `DEVICE_API_KEY` to pin it to a value you choose (do this in deployment);
 otherwise one is generated on first run and reused from then on. See
 [`.env.example`](.env.example) for every setting and its default.
 
+## Deploy it
+
+The repo carries a `Dockerfile` and a Render blueprint (`render.yaml`); both
+work on anything that runs a container and sets `$PORT` (Render, Railway,
+Fly.io, Cloud Run).
+
+On Render: **New > Blueprint**, point it at this repo, and it reads
+`render.yaml`. Then set `VITE_API_URL` on the frontend to the URL Render gives
+you and redeploy it — Vite bakes that in at build time, so changing it without a
+rebuild leaves the old value in the bundle.
+
+Two things about free tiers that bite:
+
+- **The disk is ephemeral.** The SQLite file is gone after every deploy and
+  every cold start. `SEED_DEMO=1` (set by the blueprint) rebuilds the demo
+  account's recording on startup so a shared link is never an empty dashboard —
+  but accounts other people create will not survive a restart. For storage that
+  lasts, use a plan with a disk and mount it at `/data`; `HEARTBEAT_DB` already
+  points inside it, and seeding then does nothing because the data is still
+  there.
+- **The service sleeps when idle**, so the first request after a quiet spell can
+  take the better part of a minute and look like a broken link. If it matters
+  that someone's first click is fast, ping `/` every ten minutes or so from an
+  uptime checker.
+
+One worker, deliberately: the WebSocket registry and the login throttle live in
+process memory, so a second worker would halve the rate limit and drop live
+beats for whoever's socket landed on the other one.
+
 ## Tests
 
 ```bash

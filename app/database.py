@@ -523,6 +523,44 @@ def insert_beat(
         )
 
 
+def insert_beats(rows: List[dict]) -> int:
+    """Insert many beats in one transaction.
+
+    The demo seeder writes hundreds of rows at once; going through insert_beat
+    would open a connection per row and make a cold start visibly slow.
+    Each row takes the same keys as insert_beat.
+    """
+    if not rows:
+        return 0
+    with _db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO beats
+                (user_id, patient, class_code, classification, confidence, is_abnormal,
+                 alert_level, alert_detail, bpm, flags, probabilities, samples, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r["user_id"], r["patient"], r["class_code"], r["classification"],
+                    r["confidence"], int(r["is_abnormal"]), r["alert_level"], r["alert_detail"],
+                    r.get("bpm"),
+                    json.dumps(r.get("flags") or []),
+                    json.dumps(r.get("probabilities") or {}),
+                    json.dumps(r["samples"]) if r.get("samples") else None,
+                    utc_iso(r.get("recorded_at")),
+                )
+                for r in rows
+            ],
+        )
+    return len(rows)
+
+
+def count_beats(user_id: int) -> int:
+    with _db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM beats WHERE user_id = ?", (user_id,)).fetchone()[0]
+
+
 def _filters(user_id, class_filter, abnormal_only, min_confidence, since, until):
     clauses: List[str] = []
     params: list = []

@@ -1,0 +1,14 @@
+.git
+.github
+tests
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+README.md
+pytest.ini
+requirements-dev.txt
