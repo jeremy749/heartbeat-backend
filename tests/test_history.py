@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from conftest import BEAT, auth, signup
+from conftest import BEAT, auth, signup, ticket
 
 
 def post(client, token, **over):
@@ -134,11 +134,19 @@ def test_csv_export_is_scoped_and_human_readable(client):
 
 
 def test_csv_export_works_from_a_plain_link(client):
-    """Download links cannot set headers, so the token rides in the query."""
+    """Download links cannot set headers, so a one-use ticket rides in the query."""
     user = signup(client, "Alice", "pw")
     post(client, user["token"])
-    r = client.get("/api/export.csv", params={"token": user["token"]})
+    r = client.get("/api/export.csv", params={"ticket": ticket(client, user["token"])})
     assert r.status_code == 200
+
+
+def test_a_session_token_in_the_url_no_longer_works(client):
+    """The whole point: a URL is logged, so it must not carry a 30-day credential."""
+    user = signup(client, "Alice", "pw")
+    post(client, user["token"])
+    assert client.get("/api/export.csv", params={"token": user["token"]}).status_code == 401
+    assert client.get("/api/history", params={"token": user["token"]}).status_code == 401
 
 
 def test_pdf_report_is_generated(client):

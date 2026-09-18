@@ -51,6 +51,14 @@ def signup(client, name: str, password: str = "pw") -> dict:
 
 BEAT = {"class_code": "N", "confidence": 0.9, "bpm": 70}
 
+
+def ticket(client, token: str) -> str:
+    """Mint a one-use download/socket ticket for a signed-in user."""
+    r = client.post("/api/ticket", headers=auth(token))
+    assert r.status_code == 200, r.text
+    return r.json()["ticket"]
+
+
 WS_TIMEOUT = 5.0
 
 

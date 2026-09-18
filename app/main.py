@@ -86,15 +86,31 @@ def _bearer(authorization: Optional[str]) -> Optional[str]:
     return None
 
 
-def require_user(
-    authorization: Optional[str] = Header(default=None),
-    token: Optional[str] = Query(default=None),
-) -> dict:
-    """Resolve the signed-in user from a Bearer token (header) or ?token= query.
+def require_user(authorization: Optional[str] = Header(default=None)) -> dict:
+    """Resolve the signed-in user from the Authorization header.
 
-    The query form lets plain download links (CSV export) carry the token.
+    Header only, deliberately. A session token is good for 30 days, and a URL
+    is written to the access log, the browser history and every proxy on the
+    way - so the query-parameter form this used to accept handed out a durable
+    credential in plain text. Downloads and the WebSocket, which cannot set a
+    header, use a short-lived ticket instead (see require_ticket_user).
     """
-    user = db.user_for_token(_bearer(authorization) or token)
+    user = db.user_for_token(_bearer(authorization))
+    if not user:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    return user
+
+
+def require_ticket_user(
+    authorization: Optional[str] = Header(default=None),
+    ticket: Optional[str] = Query(default=None),
+) -> dict:
+    """Authorize a download by Authorization header, or by a one-use ticket.
+
+    The ticket is what a plain <a href> or a WebSocket handshake can carry. It
+    is spent on redemption, so a URL captured from a log cannot be replayed.
+    """
+    user = db.user_for_token(_bearer(authorization)) or db.redeem_ticket(ticket)
     if not user:
         raise HTTPException(status_code=401, detail="Not signed in")
     return user
@@ -136,12 +152,14 @@ def run_retention() -> dict:
         "waveforms_dropped": db.prune_samples(),
         "beats_removed": db.delete_old_beats(),
         "sessions_purged": db.purge_expired_sessions(),
+        "tickets_purged": db.purge_expired_tickets(),
     }
     if any(result.values()):
         print(
             f"[heartbeat] retention: {result['waveforms_dropped']} waveform(s) dropped, "
             f"{result['beats_removed']} beat(s) removed, "
-            f"{result['sessions_purged']} session(s) purged"
+            f"{result['sessions_purged']} session(s) purged, "
+            f"{result['tickets_purged']} ticket(s) purged"
         )
     return result
 
@@ -176,17 +194,19 @@ def device_key() -> str:
 def require_ingest(
     x_device_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
-    token: Optional[str] = Query(default=None),
 ) -> Optional[dict]:
     """Authorize a beat ingest, by device key or by a signed-in user's token.
 
     Returns the signed-in user when a session token was used - their beats are
     then forced onto their own account - or None when a trusted device key was
     used, which may name the patient it is recording.
+
+    Headers only: a device posting a beat can always set one, so there is no
+    reason to accept a credential in the URL, where it would be logged.
     """
     if x_device_key and secrets.compare_digest(x_device_key, device_key()):
         return None
-    user = db.user_for_token(_bearer(authorization) or token)
+    user = db.user_for_token(_bearer(authorization))
     if user:
         return user
     raise HTTPException(
@@ -332,15 +352,24 @@ def login(body: LoginIn, request: Request):
 
 
 @app.post("/api/logout", tags=["users"])
-def logout(user=Depends(require_user), token: Optional[str] = Query(default=None),
-           authorization: Optional[str] = Header(default=None)):
+def logout(user=Depends(require_user), authorization: Optional[str] = Header(default=None)):
     """Invalidate the current session token."""
-    tok = token
-    if authorization and authorization.lower().startswith("bearer "):
-        tok = authorization[7:]
+    tok = _bearer(authorization)
     if tok:
         db.delete_session(tok)
     return {"status": "signed out"}
+
+
+@app.post("/api/ticket", tags=["users"])
+def issue_ticket(user=Depends(require_user)):
+    """Mint a short-lived, single-use ticket for one download or socket.
+
+    The caller puts this in the URL instead of its session token.
+    """
+    return {
+        "ticket": db.create_ticket(user["id"]),
+        "expires_in": db.TICKET_TTL_SECONDS,
+    }
 
 
 @app.get("/api/me", response_model=UserOut, tags=["users"])
@@ -482,7 +511,7 @@ def strip(count: int = Query(8, ge=1, le=50), user=Depends(require_user)):
 
 
 @app.get("/api/report.pdf", tags=["beats"])
-def report_pdf(user=Depends(require_user)):
+def report_pdf(user=Depends(require_ticket_user)):
     """Generate a one-page PDF summary of the signed-in user's readings."""
     try:
         from reportlab.lib import colors
@@ -558,7 +587,7 @@ def export_csv(
     min_confidence: Optional[float] = Query(None, ge=0.0, le=1.0),
     since: Optional[str] = Query(None),
     until: Optional[str] = Query(None),
-    user=Depends(require_user),
+    user=Depends(require_ticket_user),
 ):
     """Stream the signed-in user's (filtered) history as a CSV spreadsheet.
 
@@ -611,9 +640,13 @@ def export_csv(
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, token: Optional[str] = Query(default=None)):
-    """Frontend connects here (as /ws?token=...) to receive its own beats live."""
-    user = db.user_for_token(token)
+async def websocket_endpoint(ws: WebSocket, ticket: Optional[str] = Query(default=None)):
+    """Frontend connects here (as /ws?ticket=...) to receive its own beats live.
+
+    A ticket rather than the session token: the handshake URL is logged like any
+    other request, and this one is worthless seconds after it is issued.
+    """
+    user = db.redeem_ticket(ticket)
     if not user:
         # Accept first, *then* close. Closing before accept makes the server
         # reject the handshake with HTTP 403, which browsers surface as close

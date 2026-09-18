@@ -68,6 +68,6 @@ def _close_code_for(url: str) -> int:
     return asyncio.run(go())
 
 
-@pytest.mark.parametrize("query", ["", "?token=garbage"])
+@pytest.mark.parametrize("query", ["", "?ticket=garbage"])
 def test_rejected_socket_closes_with_4401_on_the_wire(live_server, query):
     assert _close_code_for(f"ws://{live_server}/ws{query}") == 4401

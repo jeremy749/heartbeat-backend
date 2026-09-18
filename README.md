@@ -92,15 +92,24 @@ classifier runs in (or pass `key=` explicitly).
 | Method | Path           | Purpose                                  | Auth                     |
 |--------|----------------|------------------------------------------|--------------------------|
 | POST   | `/api/login`   | Sign in / sign up, returns a token        | —                        |
+| POST   | `/api/ticket`  | Mint a one-use ticket for a download/socket | token                  |
 | POST   | `/api/beats`   | Ingest one classified beat                | device key **or** token  |
 | GET    | `/api/history` | Recent beats (`?limit=`, `?type=`)        | token                    |
 | GET    | `/api/latest`  | Most recent beat                          | token                    |
 | GET    | `/api/stats`   | Summary counts for dashboard cards        | token                    |
-| WS     | `/ws?token=`   | Live stream of *your own* new beats       | token                    |
+| GET    | `/api/export.csv` | History as a spreadsheet               | token **or** ticket      |
+| GET    | `/api/report.pdf` | One-page PDF summary                   | token **or** ticket      |
+| WS     | `/ws?ticket=`  | Live stream of *your own* new beats       | ticket                   |
 
-Read endpoints take the token as `Authorization: Bearer <token>`, or as
-`?token=` so plain download links (CSV, PDF) work. `/api/beats` takes the device
-key as an `X-Device-Key` header.
+The session token travels as `Authorization: Bearer <token>` and **only** as a
+header. It is never accepted in a query string: URLs are written to the access
+log, the browser's history and any proxy in between, and a session token is good
+for 30 days — so that form handed out a durable credential in plain text.
+
+A download link and a WebSocket handshake cannot set a header, so they carry a
+**ticket** instead: `POST /api/ticket` returns one, it lasts
+`TICKET_TTL_SECONDS` (60 by default), and it is spent the moment it is redeemed.
+A ticket recovered from a log is already useless.
 
 Two ways to post a beat:
 
@@ -115,6 +124,8 @@ Two ways to post a beat:
 - Storage is SQLite (`heartbeat.db`), created automatically on first run. No
   separate database server needed. It runs in WAL mode, so a reader is never
   blocked behind a writer.
+- Download/socket tickets are single-use and expire after `TICKET_TTL_SECONDS`;
+  spent and stale ones are cleared by the retention sweep.
 - Session tokens expire after `SESSION_TTL_HOURS` (30 days by default) and
   expired rows are purged by the retention sweep.
 - A beat's 200-sample waveform is ~1.5 KB, so at one beat a second the database

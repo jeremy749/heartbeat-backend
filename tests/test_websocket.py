@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import BEAT, auth, signup, ws_receive
+from conftest import BEAT, auth, signup, ticket, ws_receive
 
 
 def _close_code(ws):
@@ -36,23 +36,40 @@ def test_socket_without_a_token_is_closed_with_4401(client):
         assert _close_code(ws) == 4401
 
 
-def test_socket_with_a_bad_token_is_closed_with_4401(client):
-    with client.websocket_connect("/ws?token=garbage") as ws:
+def test_socket_with_a_bad_ticket_is_closed_with_4401(client):
+    with client.websocket_connect("/ws?ticket=garbage") as ws:
         assert _close_code(ws) == 4401
 
 
-def test_socket_with_an_expired_token_is_closed_with_4401(client, env):
+def test_a_session_token_is_not_accepted_as_a_ticket(client):
+    """A logged handshake URL must not be a working credential."""
+    user = signup(client, "Alice", "pw")
+    with client.websocket_connect(f"/ws?ticket={user['token']}") as ws:
+        assert _close_code(ws) == 4401
+
+
+def test_a_ticket_cannot_be_replayed(client):
+    """Single use: a captured URL is spent the moment it is first redeemed."""
+    user = signup(client, "Alice", "pw")
+    tkt = ticket(client, user["token"])
+    with client.websocket_connect(f"/ws?ticket={tkt}") as first:
+        pass
+    with client.websocket_connect(f"/ws?ticket={tkt}") as second:
+        assert _close_code(second) == 4401
+
+
+def test_socket_with_an_expired_ticket_is_closed_with_4401(client, env):
     from app import database as db
 
     user = signup(client, "Alice", "pw")
-    stale = db.create_session(user["id"], ttl_hours=-1)
-    with client.websocket_connect(f"/ws?token={stale}") as ws:
+    stale = db.create_ticket(user["id"], ttl_seconds=-1)
+    with client.websocket_connect(f"/ws?ticket={stale}") as ws:
         assert _close_code(ws) == 4401
 
 
 def test_socket_receives_the_users_own_beats(client):
     alice = signup(client, "Alice", "pw")
-    with client.websocket_connect(f"/ws?token={alice['token']}") as ws:
+    with client.websocket_connect(f"/ws?ticket={ticket(client, alice['token'])}") as ws:
         client.post("/api/beats", json=BEAT, headers=auth(alice["token"]))
         msg = _beat_frame(ws)
     assert msg["type"] == "beat"
@@ -64,7 +81,7 @@ def test_a_beat_never_reaches_another_users_socket(client):
     alice = signup(client, "Alice", "pw")
     bob = signup(client, "Bob", "pw")
 
-    with client.websocket_connect(f"/ws?token={bob['token']}") as bob_ws:
+    with client.websocket_connect(f"/ws?ticket={ticket(client, bob['token'])}") as bob_ws:
         client.post("/api/beats", json=BEAT, headers=auth(alice["token"]))
         client.post("/api/beats", json=dict(BEAT, class_code="V"), headers=auth(bob["token"]))
         msg = _beat_frame(bob_ws)

@@ -26,6 +26,13 @@ DEFAULT_USER_PASSWORD = "demo"  # the seeded demo account's password
 # How long a session token stays valid. 30 days by default.
 SESSION_TTL_HOURS = int(os.environ.get("SESSION_TTL_HOURS", "720"))
 
+# Download tickets. A browser cannot put a header on a download link or a
+# WebSocket handshake, so something has to travel in the URL - and a URL is
+# written to the access log, the browser history and any proxy in between. A
+# ticket is what goes there instead of the session token: valid for seconds,
+# good for exactly one request, and useless once redeemed.
+TICKET_TTL_SECONDS = int(os.environ.get("TICKET_TTL_SECONDS", "60"))
+
 # Retention. A beat's 200-sample waveform is ~1.5 KB - at one beat a second that
 # is ~130 MB a day, and it is only needed for the recent-strip view, so the
 # waveforms are dropped well before the beats themselves. 0 disables either one.
@@ -143,6 +150,16 @@ def init_db() -> None:
                 "UPDATE sessions SET expires_at = datetime(created_at, ?) WHERE expires_at IS NULL",
                 (f"+{SESSION_TTL_HOURS} hours",),
             )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tickets (
+                token      TEXT    PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT    NOT NULL,
+                expires_at TEXT    NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS beats (
@@ -315,6 +332,50 @@ def user_for_token(token: Optional[str]) -> Optional[dict]:
         return {"id": row["id"], "name": row["name"]}
 
 
+def create_ticket(user_id: int, ttl_seconds: Optional[int] = None) -> str:
+    """Mint a single-use, short-lived ticket for one download or socket."""
+    token = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    ttl = TICKET_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO tickets (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, user_id, utc_iso(now), utc_iso(now + timedelta(seconds=ttl))),
+        )
+    return token
+
+
+def redeem_ticket(token: Optional[str]) -> Optional[dict]:
+    """Spend a ticket and return its owner, or None if it is unusable.
+
+    Deleted whether or not it had expired: a ticket is good once, so a replay
+    of a captured URL finds nothing left to redeem.
+    """
+    if not token:
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT t.expires_at, u.id, u.name FROM tickets t
+            JOIN users u ON u.id = t.user_id
+            WHERE t.token = ?
+            """,
+            (token,),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM tickets WHERE token = ?", (token,))
+        if row["expires_at"] <= utc_iso():
+            return None
+        return {"id": row["id"], "name": row["name"]}
+
+
+def purge_expired_tickets() -> int:
+    with _db() as conn:
+        cur = conn.execute("DELETE FROM tickets WHERE expires_at <= ?", (utc_iso(),))
+        return cur.rowcount
+
+
 def purge_expired_sessions() -> int:
     """Drop timed-out sessions. Returns how many rows went."""
     with _db() as conn:
@@ -393,6 +454,7 @@ def delete_user(user_id: int) -> None:
     with _db() as conn:
         conn.execute("DELETE FROM beats WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM tickets WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         conn.commit()
 
