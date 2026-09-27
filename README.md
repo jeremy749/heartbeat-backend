@@ -99,6 +99,19 @@ export HEARTBEAT_DEVICE_KEY=<the key printed above>   # Windows: set HEARTBEAT_D
 python device_bridge.py --demo
 ```
 
+## Record the video
+
+```bash
+python demo_jeremy.py --patient Jeremy
+```
+
+A *scripted* feed, as opposed to `device_bridge.py --demo`, which is random.
+It streams mostly-normal beats and then, at a beat number you choose, three
+noisy ones that classify as Ventricular - so the banner turns red on cue and
+settles back through amber to green. Needs `HEARTBEAT_DEVICE_KEY` like any
+other feed, and stops at the first rejected beat rather than printing `ok` at
+a dashboard that is receiving nothing.
+
 ## Wire in the real classifier
 
 In `realtime_classifier.py`, after the line that classifies a beat, add:
